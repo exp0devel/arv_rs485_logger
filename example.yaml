@@ -1,0 +1,16 @@
+external_components:
+  - source: github://exp0devel/arv-rs485-logger
+    components: [arv_rs485_logger]
+
+uart:
+  id: rs485_bus
+  tx_pin: GPIO4
+  rx_pin: GPIO5
+  baud_rate: 9600
+  parity: EVEN
+  stop_bits: 1
+  rx_buffer_size: 512
+
+arv_rs485_logger:
+  id: arv_logger
+  uart_id: rs485_bus
