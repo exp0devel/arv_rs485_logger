@@ -1,5 +1,4 @@
-import esphome.codegen as cg
-import esphome.config_validation as cv
+from esphome import codegen as cg, config_validation as cv
 from esphome.const import CONF_ID
 from esphome.components import uart
 
