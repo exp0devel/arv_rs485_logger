@@ -1,4 +1,7 @@
 #include "esphome.h"
+#include "esphome/components/uart/uart.h"
+#include "esphome/core/component.h"
+#include "esphome/core/helpers.h"
 
 class ArvRs485Logger : public Component, public UARTDevice {
  public:
