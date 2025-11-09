@@ -1,5 +1,4 @@
 #pragma once
-
 #include <vector>
 #include <string>
 #include <cstdio>
@@ -15,14 +14,6 @@ namespace arv_rs485_logger {
 
 static const char *const TAG = "arv_rs485_logger";
 
-/**
- * UART burst sniffer with filters:
- * - Burst framing by idle gap (min_gap_us)
- * - Size cap (max_burst_len)
- * - Drop short bursts (min_length)
- * - Dedupe identical bursts within dedupe_ms
- * - Idle-filter: drop bursts consisting only of bytes in idle_bytes
- */
 class ArvRs485Logger : public Component, public uart::UARTDevice {
  public:
   ArvRs485Logger() = default;
@@ -41,29 +32,36 @@ class ArvRs485Logger : public Component, public uart::UARTDevice {
   }
 
   void setup() override {
-    ESP_LOGI(TAG,
-             "Sniffer ready: gap=%u us, max_len=%u, min_len=%u, dedupe=%u ms, idle_filter=%s, idle_set=%u bytes",
+    ESP_LOGI(TAG, "Sniffer ready: gap=%u us, max_len=%u, min_len=%u, dedupe=%u ms, idle_filter=%s",
              (unsigned) min_gap_us_, (unsigned) max_burst_len_, (unsigned) min_length_,
-             (unsigned) dedupe_ms_, idle_filter_ ? "on" : "off", (unsigned) idle_bytes_.size());
+             (unsigned) dedupe_ms_, idle_filter_ ? "on" : "off");
   }
 
   void loop() override {
-    const uint32_t now = micros();
+    const uint32_t now_us = micros();
+    const uint32_t now_ms = millis();
 
-    // Gap-based flush
-    if (!burst_.empty() && (now - last_byte_us_) > min_gap_us_) {
+    // 1) Gap-based flush (normal path)
+    if (!burst_.empty() && (now_us - last_byte_us_) > min_gap_us_) {
       handle_flush_();
     }
 
-    // Drain UART
+    // 2) Force flush if stream never idles (safety net every 50 ms)
+    if (!burst_.empty() && (now_ms - last_force_flush_ms_) > force_flush_ms_) {
+      handle_flush_();
+      last_force_flush_ms_ = now_ms;
+    }
+
+    // 3) Drain UART
     while (this->available()) {
       uint8_t b;
       if (!this->read_byte(&b)) break;
+
       if (burst_.size() >= max_burst_len_) {
-        handle_flush_();  // hard flush before overflow
+        handle_flush_();                 // flush large continuous block
       }
       burst_.push_back(b);
-      last_byte_us_ = micros();
+      last_byte_us_ = micros();          // update after we actually read a byte
     }
   }
 
@@ -90,8 +88,7 @@ class ArvRs485Logger : public Component, public uart::UARTDevice {
       if (!std::binary_search(idle_bytes_.begin(), idle_bytes_.end(), b))
         return true;  // contains at least one non-idle byte -> keep
     }
-    // all bytes were from idle set -> drop
-    return false;
+    return false;      // all bytes were from idle set -> drop
   }
 
   // ---------- Flush & Log ----------
@@ -104,7 +101,6 @@ class ArvRs485Logger : public Component, public uart::UARTDevice {
   void handle_flush_() {
     if (burst_.empty()) return;
 
-    // Apply filters in order
     bool keep = true;
     if (keep) keep = pass_min_length_(burst_);
     if (keep) keep = pass_idle_set_(burst_);
@@ -115,7 +111,6 @@ class ArvRs485Logger : public Component, public uart::UARTDevice {
       ESP_LOGD(TAG, "Burst %u bytes: %s", (unsigned) burst_.size(), hex.c_str());
       ESP_LOGV(TAG, "ASCII: %s", ascii_hint_(burst_).c_str());
     }
-
     burst_.clear();
   }
 
@@ -125,13 +120,15 @@ class ArvRs485Logger : public Component, public uart::UARTDevice {
   std::vector<uint8_t> idle_bytes_;
   uint32_t last_printed_ms_{0};
   uint32_t last_byte_us_{0};
+  uint32_t last_force_flush_ms_{0};
 
   // Tunables (defaults)
-  uint32_t min_gap_us_{5000};
-  size_t   max_burst_len_{512};
-  size_t   min_length_{8};
-  uint32_t dedupe_ms_{200};
-  bool     idle_filter_{true};
+  uint32_t min_gap_us_{1200};  // tighter default
+  size_t   max_burst_len_{256};
+  size_t   min_length_{1};
+  uint32_t dedupe_ms_{0};
+  bool     idle_filter_{false};
+  const uint32_t force_flush_ms_{50}; // <-- periodic safety flush
 };
 
 }  // namespace arv_rs485_logger
