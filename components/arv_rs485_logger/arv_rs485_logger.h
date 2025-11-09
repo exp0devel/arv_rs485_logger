@@ -24,61 +24,21 @@ class ArvRs485Logger : public Component, public uart::UARTDevice {
   }
 
   void loop() override {
-    // Read whatever is available
+    static std::vector<uint8_t> buf;
+    static uint32_t last = 0;
+    const uint32_t now = micros();
+
+    if (!buf.empty() && (now - last) > 5000) {
+      ESP_LOGD("sniff", "Burst %u bytes: %s",
+              (unsigned)buf.size(), format_hex_pretty(buf).c_str());
+      buf.clear();
+    }
+
     while (this->available()) {
       uint8_t b;
-      if (!this->read_byte(&b)) break;
-      buffer_.push_back(b);
-
-      // Raw byte trace (comment out later)
-      ESP_LOGV(TAG, "RX 0x%02X", b);
-
-      // Resync to 0xAA start
-      if (buffer_.size() == 1 && buffer_[0] != 0xAA) {
-        // show unsynced noise in chunks
-        if (buffer_.size() >= 16) {
-          ESP_LOGV(TAG, "Unsynced: %s", format_hex_pretty(buffer_).c_str());
-          buffer_.clear();
-        } else {
-          // keep waiting for 0xAA
-          if (buffer_[0] != 0xAA) buffer_.clear();
-        }
-        continue;
-      }
-
-      // Need at least header [AA, len]
-      if (buffer_.size() >= 2 && buffer_[0] == 0xAA) {
-        uint8_t len = buffer_[1];
-        const size_t frame_total = static_cast<size_t>(len) + 2; // keep your protocol assumption
-
-        if (buffer_.size() >= frame_total) {
-          std::vector<uint8_t> frame(buffer_.begin(), buffer_.begin() + frame_total);
-
-          if (frame_total >= 4) {
-            uint16_t crc_calc = crc16(frame.data(), frame.size() - 2);
-            uint16_t crc_rcv = static_cast<uint16_t>(frame[frame.size() - 2])
-                            | (static_cast<uint16_t>(frame.back()) << 8);
-
-            if (crc_calc == crc_rcv) {
-              ESP_LOGD(TAG, "Valid frame: %s → %s",
-                      format_hex_pretty(frame).c_str(),
-                      decode_frame(frame).c_str());
-            } else {
-              ESP_LOGW(TAG, "CRC mismatch: %s (calc=0x%04X recv=0x%04X)",
-                      format_hex_pretty(frame).c_str(), crc_calc, crc_rcv);
-            }
-          } else {
-            ESP_LOGV(TAG, "Short frame: %s", format_hex_pretty(frame).c_str());
-          }
-
-          buffer_.erase(buffer_.begin(), buffer_.begin() + frame_total);
-          // If next byte isn’t 0xAA, purge to resync
-          if (!buffer_.empty() && buffer_[0] != 0xAA) buffer_.clear();
-        } else if (buffer_.size() > 128) {
-          ESP_LOGV(TAG, "Overflow guard, partial: %s", format_hex_pretty(buffer_).c_str());
-          buffer_.clear();
-        }
-      }
+      this->read_byte(&b);
+      buf.push_back(b);
+      last = micros();
     }
   }
 
