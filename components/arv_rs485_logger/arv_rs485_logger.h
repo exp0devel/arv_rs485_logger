@@ -24,64 +24,64 @@ class ArvRs485Logger : public Component, public uart::UARTDevice {
   }
 
   void loop() override {
+    // Read whatever is available
     while (this->available()) {
-      uint8_t byte;
-      if (!this->read_byte(&byte))
-        break;
+      uint8_t b;
+      if (!this->read_byte(&b)) break;
+      buffer_.push_back(b);
 
-      buffer_.push_back(byte);
+      // Raw byte trace (comment out later)
+      ESP_LOGV(TAG, "RX 0x%02X", b);
 
-      // try to resync to 0xAA start
+      // Resync to 0xAA start
       if (buffer_.size() == 1 && buffer_[0] != 0xAA) {
-        buffer_.clear();
+        // show unsynced noise in chunks
+        if (buffer_.size() >= 16) {
+          ESP_LOGV(TAG, "Unsynced: %s", format_hex_pretty(buffer_).c_str());
+          buffer_.clear();
+        } else {
+          // keep waiting for 0xAA
+          if (buffer_[0] != 0xAA) buffer_.clear();
+        }
         continue;
       }
 
-      // We need at least header [0xAA, len]
+      // Need at least header [AA, len]
       if (buffer_.size() >= 2 && buffer_[0] == 0xAA) {
         uint8_t len = buffer_[1];
-        // frame = 0xAA + len + payload(len bytes?) + CRC_L + CRC_H
-        // You wrote "len + 2" earlier; commonly it's 2(header)+len+2(CRC)=len+4 total.
-        // If your proto really is len+2 total, keep that. Otherwise, adjust here.
-        // Based on your original code, we'll keep len+2 total bytes after 0xAA.
-        // That means total frame size = len + 2.
-        const size_t frame_total = static_cast<size_t>(len) + 2;
+        const size_t frame_total = static_cast<size_t>(len) + 2; // keep your protocol assumption
 
         if (buffer_.size() >= frame_total) {
           std::vector<uint8_t> frame(buffer_.begin(), buffer_.begin() + frame_total);
 
           if (frame_total >= 4) {
-            // last two bytes are CRC_L, CRC_H per your code
             uint16_t crc_calc = crc16(frame.data(), frame.size() - 2);
             uint16_t crc_rcv = static_cast<uint16_t>(frame[frame.size() - 2])
-                             | (static_cast<uint16_t>(frame.back()) << 8);
+                            | (static_cast<uint16_t>(frame.back()) << 8);
 
             if (crc_calc == crc_rcv) {
-              // Pretty hex plus decoded text
-              std::string hex = format_hex_pretty(frame);
-              std::string desc = decode_frame(frame);
-              ESP_LOGD(TAG, "Valid frame: %s → %s", hex.c_str(), desc.c_str());
+              ESP_LOGD(TAG, "Valid frame: %s → %s",
+                      format_hex_pretty(frame).c_str(),
+                      decode_frame(frame).c_str());
             } else {
-              ESP_LOGV(TAG, "CRC mismatch (calc=0x%04X recv=0x%04X)", crc_calc, crc_rcv);
+              ESP_LOGW(TAG, "CRC mismatch: %s (calc=0x%04X recv=0x%04X)",
+                      format_hex_pretty(frame).c_str(), crc_calc, crc_rcv);
             }
+          } else {
+            ESP_LOGV(TAG, "Short frame: %s", format_hex_pretty(frame).c_str());
           }
 
-          // drop the processed frame and keep scanning
           buffer_.erase(buffer_.begin(), buffer_.begin() + frame_total);
-          // If next byte isn't 0xAA, try to resync
-          if (!buffer_.empty() && buffer_[0] != 0xAA) {
-            buffer_.clear();
-          }
-        } else {
-          // not enough bytes for a complete frame yet
-          if (buffer_.size() > 128)  // simple overflow guard
-            buffer_.clear();
+          // If next byte isn’t 0xAA, purge to resync
+          if (!buffer_.empty() && buffer_[0] != 0xAA) buffer_.clear();
+        } else if (buffer_.size() > 128) {
+          ESP_LOGV(TAG, "Overflow guard, partial: %s", format_hex_pretty(buffer_).c_str());
+          buffer_.clear();
         }
-      } else if (buffer_.size() > 128) {
-        buffer_.clear();
       }
     }
   }
+
 
  protected:
   // Modbus-like CRC16 (0xA001) used in your code
