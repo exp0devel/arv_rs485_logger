@@ -11,85 +11,92 @@
 namespace esphome {
 namespace arv_rs485_logger {
 
+// unified tag for logs
 static const char *const TAG = "arv_rs485_logger";
 
-// AA <len> ... <CRC_L> <CRC_H>
+/**
+ * A UART burst sniffer:
+ * - collects bytes into a buffer
+ * - if inter-byte gap > min_gap_us, flushes the buffer as one "burst"
+ * - prints HEX and ASCII-ish view for quick eyeballing
+ */
 class ArvRs485Logger : public Component, public uart::UARTDevice {
  public:
-  // ESPHome constructs with uart.register_uart_device(var, config)
   ArvRs485Logger() = default;
 
+  void set_min_gap_us(uint32_t us)   { this->min_gap_us_ = us; }
+  void set_max_burst_len(size_t len) { this->max_burst_len_ = len; }
+
   void setup() override {
-    // nothing for now
+    ESP_LOGI(TAG, "Sniffer ready. min_gap_us=%u, max_burst_len=%u",
+             (unsigned) this->min_gap_us_, (unsigned) this->max_burst_len_);
   }
 
   void loop() override {
-    static std::vector<uint8_t> buf;
-    static uint32_t last = 0;
     const uint32_t now = micros();
 
-    if (!buf.empty() && (now - last) > 5000) {
-      ESP_LOGD("sniff", "Burst %u bytes: %s",
-              (unsigned)buf.size(), format_hex_pretty(buf).c_str());
-      buf.clear();
+    // If we have data accumulated and we've been idle for long enough, flush it.
+    if (!buf_.empty() && elapsed_since_last(now) > this->min_gap_us_) {
+      flush_burst_();
     }
 
+    // Consume all available bytes
     while (this->available()) {
       uint8_t b;
-      this->read_byte(&b);
-      buf.push_back(b);
-      last = micros();
+      if (!this->read_byte(&b)) break;
+
+      if (buf_.size() < this->max_burst_len_) {
+        buf_.push_back(b);
+      } else {
+        // Hard flush if someone sent a very long block without gaps
+        flush_burst_();
+        buf_.push_back(b);
+      }
+      last_byte_us_ = now_safe_();
     }
   }
-
 
  protected:
-  // Modbus-like CRC16 (0xA001) used in your code
-  static uint16_t crc16(const uint8_t *data, size_t size) {
-    uint16_t crc = 0xFFFF;
-    for (size_t i = 0; i < size; i++) {
-      crc ^= data[i];
-      for (int j = 0; j < 8; j++) {
-        if (crc & 1)
-          crc = (crc >> 1) ^ 0xA001;
-        else
-          crc >>= 1;
-      }
-    }
-    return crc;
+  // --- helpers ---
+
+  // elapsed microseconds since last byte, using the current micros()
+  inline uint32_t elapsed_since_last(uint32_t now) const {
+    return now - this->last_byte_us_;  // micros() is unsigned and wraps safely
   }
 
-  static std::string decode_frame(const std::vector<uint8_t> &frame) {
-    // Your original decode logic, kept as-is
-    if (frame.size() < 5) return "Invalid";
-    uint8_t cmd = frame[4];
-    char desc[64];
-    if (cmd == 0x01) {
-      const char* on_off = frame.size() > 5 && frame[5] ? "ON" : "OFF";
-      const char* modes[] = {"?", "Cool", "Dry", "Fan", "Heat", "Auto"};
-      uint8_t mode = (frame.size() > 6) ? (frame[6] % 6) : 0;
-      snprintf(desc, sizeof(desc), "Power %s, Mode %s", on_off, modes[mode]);
-    } else if (cmd == 0x02) {
-      int temp = (frame.size() > 5) ? frame[5] : -1;
-      snprintf(desc, sizeof(desc), "Set temp %d °C", temp);
-    } else if (cmd == 0x03) {
-      const char* fans[] = {"?", "Low", "Med", "High", "Auto"};
-      uint8_t f = (frame.size() > 5) ? (frame[5] % 5) : 0;
-      snprintf(desc, sizeof(desc), "Fan %s", fans[f]);
-    } else if (cmd == 0x04) {
-      bool on = (frame.size() > 5) ? (frame[5] != 0) : false;
-      snprintf(desc, sizeof(desc), "Swing %s", on ? "ON" : "OFF");
-    } else if (cmd == 0x10) {
-      return "Status request";
-    } else if (cmd == 0x11) {
-      return "Status reply";
-    } else {
-      return "Unknown cmd";
+  inline uint32_t now_safe_() const { return micros(); }
+
+  static std::string ascii_hint_(const std::vector<uint8_t> &v) {
+    // Build a printable ASCII string, dots for non-printables
+    std::string s;
+    s.reserve(v.size());
+    for (auto b : v) {
+      if (b >= 32 && b <= 126) s.push_back(char(b));
+      else s.push_back('.');
     }
-    return std::string(desc);
+    return s;
   }
 
-  std::vector<uint8_t> buffer_;
+  void flush_burst_() {
+    if (buf_.empty()) return;
+
+    // Pretty hex dump
+    std::string hex = format_hex_pretty(buf_);
+    // ASCII hint (not perfect but helpful)
+    std::string asc = ascii_hint_(buf_);
+
+    // One line at DEBUG, raw bytes at VERY_VERBOSE
+    ESP_LOGD(TAG, "Burst %u bytes: %s", (unsigned) buf_.size(), hex.c_str());
+    ESP_LOGV(TAG, "ASCII: %s", asc.c_str());
+
+    buf_.clear();
+  }
+
+  // --- state ---
+  std::vector<uint8_t> buf_;
+  uint32_t last_byte_us_ = 0;
+  uint32_t min_gap_us_   = 5000;  // default 5 ms
+  size_t   max_burst_len_ = 256;  // default safety cap
 };
 
 }  // namespace arv_rs485_logger
