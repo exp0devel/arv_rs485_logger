@@ -3,6 +3,8 @@
 #include <vector>
 #include <string>
 #include <cstdio>
+#include <cstdint>
+#include <algorithm>
 #include "esphome/core/component.h"
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
@@ -11,92 +13,125 @@
 namespace esphome {
 namespace arv_rs485_logger {
 
-// unified tag for logs
 static const char *const TAG = "arv_rs485_logger";
 
 /**
- * A UART burst sniffer:
- * - collects bytes into a buffer
- * - if inter-byte gap > min_gap_us, flushes the buffer as one "burst"
- * - prints HEX and ASCII-ish view for quick eyeballing
+ * UART burst sniffer with filters:
+ * - Burst framing by idle gap (min_gap_us)
+ * - Size cap (max_burst_len)
+ * - Drop short bursts (min_length)
+ * - Dedupe identical bursts within dedupe_ms
+ * - Idle-filter: drop bursts consisting only of bytes in idle_bytes
  */
 class ArvRs485Logger : public Component, public uart::UARTDevice {
  public:
   ArvRs485Logger() = default;
 
-  void set_min_gap_us(uint32_t us)   { this->min_gap_us_ = us; }
-  void set_max_burst_len(size_t len) { this->max_burst_len_ = len; }
+  // YAML setters
+  void set_min_gap_us(uint32_t v)   { min_gap_us_ = v; }
+  void set_max_burst_len(size_t v)  { max_burst_len_ = v; }
+  void set_min_length(size_t v)     { min_length_ = v; }
+  void set_dedupe_ms(uint32_t v)    { dedupe_ms_ = v; }
+  void set_idle_filter(bool v)      { idle_filter_ = v; }
+  void set_idle_bytes(const std::vector<int> &v) {
+    idle_bytes_.clear();
+    for (int x : v) idle_bytes_.push_back(static_cast<uint8_t>(x & 0xFF));
+    std::sort(idle_bytes_.begin(), idle_bytes_.end());
+    idle_bytes_.erase(std::unique(idle_bytes_.begin(), idle_bytes_.end()), idle_bytes_.end());
+  }
 
   void setup() override {
-    ESP_LOGI(TAG, "Sniffer ready. min_gap_us=%u, max_burst_len=%u",
-             (unsigned) this->min_gap_us_, (unsigned) this->max_burst_len_);
+    ESP_LOGI(TAG,
+             "Sniffer ready: gap=%u us, max_len=%u, min_len=%u, dedupe=%u ms, idle_filter=%s, idle_set=%u bytes",
+             (unsigned) min_gap_us_, (unsigned) max_burst_len_, (unsigned) min_length_,
+             (unsigned) dedupe_ms_, idle_filter_ ? "on" : "off", (unsigned) idle_bytes_.size());
   }
 
   void loop() override {
     const uint32_t now = micros();
 
-    // If we have data accumulated and we've been idle for long enough, flush it.
-    if (!buf_.empty() && elapsed_since_last(now) > this->min_gap_us_) {
-      flush_burst_();
+    // Gap-based flush
+    if (!burst_.empty() && (now - last_byte_us_) > min_gap_us_) {
+      handle_flush_();
     }
 
-    // Consume all available bytes
+    // Drain UART
     while (this->available()) {
       uint8_t b;
       if (!this->read_byte(&b)) break;
-
-      if (buf_.size() < this->max_burst_len_) {
-        buf_.push_back(b);
-      } else {
-        // Hard flush if someone sent a very long block without gaps
-        flush_burst_();
-        buf_.push_back(b);
+      if (burst_.size() >= max_burst_len_) {
+        handle_flush_();  // hard flush before overflow
       }
-      last_byte_us_ = now_safe_();
+      burst_.push_back(b);
+      last_byte_us_ = micros();
     }
   }
 
  protected:
-  // --- helpers ---
-
-  // elapsed microseconds since last byte, using the current micros()
-  inline uint32_t elapsed_since_last(uint32_t now) const {
-    return now - this->last_byte_us_;  // micros() is unsigned and wraps safely
+  // ---------- Filters ----------
+  bool pass_min_length_(const std::vector<uint8_t> &v) const {
+    return v.size() >= min_length_;
   }
 
-  inline uint32_t now_safe_() const { return micros(); }
+  bool pass_dedupe_(const std::vector<uint8_t> &v) {
+    const uint32_t now_ms = millis();
+    if (v == last_printed_ && (now_ms - last_printed_ms_) < dedupe_ms_)
+      return false;
+    last_printed_ = v;
+    last_printed_ms_ = now_ms;
+    return true;
+  }
 
-  static std::string ascii_hint_(const std::vector<uint8_t> &v) {
-    // Build a printable ASCII string, dots for non-printables
-    std::string s;
-    s.reserve(v.size());
+  bool pass_idle_set_(const std::vector<uint8_t> &v) const {
+    if (!idle_filter_) return true;
+    if (v.size() > 64) return true;  // long frames are never idle
+    if (idle_bytes_.empty()) return true;
     for (auto b : v) {
-      if (b >= 32 && b <= 126) s.push_back(char(b));
-      else s.push_back('.');
+      if (!std::binary_search(idle_bytes_.begin(), idle_bytes_.end(), b))
+        return true;  // contains at least one non-idle byte -> keep
     }
+    // all bytes were from idle set -> drop
+    return false;
+  }
+
+  // ---------- Flush & Log ----------
+  static std::string ascii_hint_(const std::vector<uint8_t> &v) {
+    std::string s; s.reserve(v.size());
+    for (auto b : v) s.push_back((b >= 32 && b <= 126) ? char(b) : '.');
     return s;
   }
 
-  void flush_burst_() {
-    if (buf_.empty()) return;
+  void handle_flush_() {
+    if (burst_.empty()) return;
 
-    // Pretty hex dump
-    std::string hex = format_hex_pretty(buf_);
-    // ASCII hint (not perfect but helpful)
-    std::string asc = ascii_hint_(buf_);
+    // Apply filters in order
+    bool keep = true;
+    if (keep) keep = pass_min_length_(burst_);
+    if (keep) keep = pass_idle_set_(burst_);
+    if (keep) keep = pass_dedupe_(burst_);
 
-    // One line at DEBUG, raw bytes at VERY_VERBOSE
-    ESP_LOGD(TAG, "Burst %u bytes: %s", (unsigned) buf_.size(), hex.c_str());
-    ESP_LOGV(TAG, "ASCII: %s", asc.c_str());
+    if (keep) {
+      std::string hex = format_hex_pretty(burst_);
+      ESP_LOGD(TAG, "Burst %u bytes: %s", (unsigned) burst_.size(), hex.c_str());
+      ESP_LOGV(TAG, "ASCII: %s", ascii_hint_(burst_).c_str());
+    }
 
-    buf_.clear();
+    burst_.clear();
   }
 
-  // --- state ---
-  std::vector<uint8_t> buf_;
-  uint32_t last_byte_us_ = 0;
-  uint32_t min_gap_us_   = 5000;  // default 5 ms
-  size_t   max_burst_len_ = 256;  // default safety cap
+  // ---------- State ----------
+  std::vector<uint8_t> burst_;
+  std::vector<uint8_t> last_printed_;
+  std::vector<uint8_t> idle_bytes_;
+  uint32_t last_printed_ms_{0};
+  uint32_t last_byte_us_{0};
+
+  // Tunables (defaults)
+  uint32_t min_gap_us_{5000};
+  size_t   max_burst_len_{512};
+  size_t   min_length_{8};
+  uint32_t dedupe_ms_{200};
+  bool     idle_filter_{true};
 };
 
 }  // namespace arv_rs485_logger
