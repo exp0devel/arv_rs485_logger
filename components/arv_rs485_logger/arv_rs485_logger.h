@@ -67,6 +67,42 @@ class ArvRs485Logger : public Component, public uart::UARTDevice {
   }
 
  private:
+  // ---- helpers ----
+  static bool is_printable(uint8_t b) { return b >= 32 && b <= 126; }
+
+  bool looks_like_frame_(const std::vector<uint8_t>& v) const {
+    // AUX frames usually end with FE/7E and are >=10 bytes
+    if (v.size() < 10) return false;
+    uint8_t last = v.back();
+    if (!(last == 0xFE || last == 0x7E)) return false;
+
+    // reject bursts composed only of idle/poll bytes
+    if (idle_filter_ && v.size() <= 64 && !idle_bytes_.empty()) {
+      bool all_idle = true;
+      for (auto b : v) {
+        if (!std::binary_search(idle_bytes_.begin(), idle_bytes_.end(), b)) {
+          all_idle = false;
+          break;
+        }
+      }
+      if (all_idle) return false;
+    }
+
+    // require some byte variety (simple entropy test)
+    uint8_t hist[256] = {0};
+    int uniq = 0;
+    for (uint8_t b : v) if (!hist[b]++) uniq++;
+    if (uniq < std::min<int>(6, static_cast<int>(v.size() / 2))) return false;
+
+    return true;
+  }
+
+  static std::string ascii_hint_(const std::vector<uint8_t> &v) {
+    std::string s; s.reserve(v.size());
+    for (auto b : v) s.push_back(is_printable(b) ? char(b) : '.');
+    return s;
+  }
+
   // ---- filters ----
   bool pass_min_length_(const std::vector<uint8_t> &v) const {
     return v.size() >= min_length_;
@@ -83,21 +119,15 @@ class ArvRs485Logger : public Component, public uart::UARTDevice {
 
   bool pass_idle_set_(const std::vector<uint8_t> &v) const {
     if (!idle_filter_) return true;
-    if (v.size() > 64) return true;          // longer bursts are never idle chatter
+    if (v.size() > 64) return true; // longer bursts are never idle chatter
     if (idle_bytes_.empty()) return true;
-    for (auto b : v) {
+    for (auto b : v)
       if (!std::binary_search(idle_bytes_.begin(), idle_bytes_.end(), b))
-        return true;                          // has a non-idle byte -> keep
-    }
-    return false;                             // all bytes were idle-set
+        return true;
+    return false;
   }
 
-  static std::string ascii_hint_(const std::vector<uint8_t> &v) {
-    std::string s; s.reserve(v.size());
-    for (auto b : v) s.push_back((b >= 32 && b <= 126) ? char(b) : '.');
-    return s;
-  }
-
+  // ---- main flush with heuristics ----
   void flush_() {
     if (burst_.empty()) return;
 
@@ -105,10 +135,23 @@ class ArvRs485Logger : public Component, public uart::UARTDevice {
     if (keep) keep = pass_min_length_(burst_);
     if (keep) keep = pass_idle_set_(burst_);
     if (keep) keep = pass_dedupe_(burst_);
+    if (keep) keep = looks_like_frame_(burst_);  // <- new heuristics
 
     if (keep) {
+      bool novel = false;
+      if (burst_.size() <= 16) {
+        if (std::find(seen_short_.begin(), seen_short_.end(), burst_) == seen_short_.end()) {
+          novel = true;
+          seen_short_.push_back(burst_);
+          if (seen_short_.size() > 50) seen_short_.erase(seen_short_.begin());
+        }
+      }
+
       std::string hex = format_hex_pretty(burst_);
-      ESP_LOGD(TAG, "Burst %u bytes: %s", (unsigned)burst_.size(), hex.c_str());
+      ESP_LOGD(TAG, "%sBurst %u bytes: %s",
+               novel ? "[NEW] " : "",
+               (unsigned)burst_.size(),
+               hex.c_str());
       ESP_LOGV(TAG, "ASCII: %s", ascii_hint_(burst_).c_str());
     }
     burst_.clear();
@@ -118,6 +161,7 @@ class ArvRs485Logger : public Component, public uart::UARTDevice {
   std::vector<uint8_t> burst_;
   std::vector<uint8_t> last_printed_;
   std::vector<uint8_t> idle_bytes_;
+  std::vector<std::vector<uint8_t>> seen_short_;
   uint32_t last_byte_us_{0};
   uint32_t last_force_flush_ms_{0};
   uint32_t last_printed_ms_{0};
