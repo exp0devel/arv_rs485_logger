@@ -1,12 +1,9 @@
 #pragma once
 #include <vector>
 #include <string>
-#include <cstdio>
-#include <cstdint>
-#include <algorithm>
+#include <unordered_map>
 #include "esphome/core/component.h"
 #include "esphome/core/log.h"
-#include "esphome/core/helpers.h"
 #include "esphome/components/uart/uart.h"
 
 namespace esphome {
@@ -14,121 +11,120 @@ namespace arv_rs485_logger {
 
 static const char *const TAG = "arv_rs485_logger";
 
+// Helper to pretty hex without spaces if you need exact matching
+static std::string hex_join(const std::vector<uint8_t> &v, const char *sep = ".") {
+  char buf[4];
+  std::string s;
+  for (size_t i = 0; i < v.size(); i++) {
+    snprintf(buf, sizeof(buf), "%02X", v[i]);
+    if (i) s += sep;
+    s += buf;
+  }
+  return s;
+}
+
 class ArvRs485Logger : public Component, public uart::UARTDevice {
  public:
   ArvRs485Logger() = default;
 
-  // YAML setters
-  void set_min_gap_us(uint32_t v)   { min_gap_us_ = v; }
-  void set_max_burst_len(size_t v)  { max_burst_len_ = v; }
-  void set_min_length(size_t v)     { min_length_ = v; }
-  void set_dedupe_ms(uint32_t v)    { dedupe_ms_ = v; }
-  void set_idle_filter(bool v)      { idle_filter_ = v; }
-  void set_idle_bytes(const std::vector<int> &v) {
-    idle_bytes_.clear();
-    for (int x : v) idle_bytes_.push_back(static_cast<uint8_t>(x & 0xFF));
-    std::sort(idle_bytes_.begin(), idle_bytes_.end());
-    idle_bytes_.erase(std::unique(idle_bytes_.begin(), idle_bytes_.end()), idle_bytes_.end());
-  }
+  // Tuning knobs
+  uint32_t gap_us = 4000;          // inter-byte gap to break a burst
+  size_t min_len_to_log = 4;       // ignore tiny splinters
+  bool log_everything = false;     // set true to dump all bursts
+  uint32_t learn_ms = 2000;        // time to learn frequent bursts
+  uint32_t chatter_threshold = 40; // how many times within window to consider "chatter"
+  bool highlight_sentinels = true; // mark bursts that end with FE/7E
 
   void setup() override {
-    ESP_LOGI(TAG, "Sniffer ready: gap=%u us, max_len=%u, min_len=%u, dedupe=%u ms, idle_filter=%s",
-             (unsigned) min_gap_us_, (unsigned) max_burst_len_, (unsigned) min_length_,
-             (unsigned) dedupe_ms_, idle_filter_ ? "on" : "off");
+    last_byte_us_ = micros();
+    learn_until_ms_ = millis() + learn_ms;
+    freq_window_start_ms_ = millis();
   }
 
   void loop() override {
     const uint32_t now_us = micros();
-    const uint32_t now_ms = millis();
 
-    // 1) Gap-based flush (normal path)
-    if (!burst_.empty() && (now_us - last_byte_us_) > min_gap_us_) {
-      handle_flush_();
+    // If we have an open burst and a big gap elapsed, flush it
+    if (!buf_.empty() && (now_us - last_byte_us_) > gap_us) {
+      handle_burst(buf_);
+      buf_.clear();
     }
 
-    // 2) Force flush if stream never idles (safety net every 50 ms)
-    if (!burst_.empty() && (now_ms - last_force_flush_ms_) > force_flush_ms_) {
-      handle_flush_();
-      last_force_flush_ms_ = now_ms;
-    }
-
-    // 3) Drain UART
+    // Drain UART
     while (this->available()) {
       uint8_t b;
-      if (!this->read_byte(&b)) break;
-
-      if (burst_.size() >= max_burst_len_) {
-        handle_flush_();                 // flush large continuous block
+      this->read_byte(&b);
+      // New burst if big gap
+      const uint32_t t = micros();
+      if (!buf_.empty() && (t - last_byte_us_) > gap_us) {
+        handle_burst(buf_);
+        buf_.clear();
       }
-      burst_.push_back(b);
-      last_byte_us_ = micros();          // update after we actually read a byte
+      buf_.push_back(b);
+      last_byte_us_ = t;
     }
   }
 
  protected:
-  // ---------- Filters ----------
-  bool pass_min_length_(const std::vector<uint8_t> &v) const {
-    return v.size() >= min_length_;
-  }
-
-  bool pass_dedupe_(const std::vector<uint8_t> &v) {
-    const uint32_t now_ms = millis();
-    if (v == last_printed_ && (now_ms - last_printed_ms_) < dedupe_ms_)
-      return false;
-    last_printed_ = v;
-    last_printed_ms_ = now_ms;
-    return true;
-  }
-
-  bool pass_idle_set_(const std::vector<uint8_t> &v) const {
-    if (!idle_filter_) return true;
-    if (v.size() > 64) return true;  // long frames are never idle
-    if (idle_bytes_.empty()) return true;
-    for (auto b : v) {
-      if (!std::binary_search(idle_bytes_.begin(), idle_bytes_.end(), b))
-        return true;  // contains at least one non-idle byte -> keep
-    }
-    return false;      // all bytes were from idle set -> drop
-  }
-
-  // ---------- Flush & Log ----------
-  static std::string ascii_hint_(const std::vector<uint8_t> &v) {
-    std::string s; s.reserve(v.size());
-    for (auto b : v) s.push_back((b >= 32 && b <= 126) ? char(b) : '.');
-    return s;
-  }
-
-  void handle_flush_() {
-    if (burst_.empty()) return;
-
-    bool keep = true;
-    if (keep) keep = pass_min_length_(burst_);
-    if (keep) keep = pass_idle_set_(burst_);
-    if (keep) keep = pass_dedupe_(burst_);
-
-    if (keep) {
-      std::string hex = format_hex_pretty(burst_);
-      ESP_LOGD(TAG, "Burst %u bytes: %s", (unsigned) burst_.size(), hex.c_str());
-      ESP_LOGV(TAG, "ASCII: %s", ascii_hint_(burst_).c_str());
-    }
-    burst_.clear();
-  }
-
-  // ---------- State ----------
-  std::vector<uint8_t> burst_;
-  std::vector<uint8_t> last_printed_;
-  std::vector<uint8_t> idle_bytes_;
-  uint32_t last_printed_ms_{0};
+  std::vector<uint8_t> buf_;
   uint32_t last_byte_us_{0};
-  uint32_t last_force_flush_ms_{0};
 
-  // Tunables (defaults)
-  uint32_t min_gap_us_{1200};  // tighter default
-  size_t   max_burst_len_{256};
-  size_t   min_length_{1};
-  uint32_t dedupe_ms_{0};
-  bool     idle_filter_{false};
-  const uint32_t force_flush_ms_{50}; // <-- periodic safety flush
+  // Frequency learning
+  std::unordered_map<std::string, uint16_t> freq_; // signature -> count in window
+  uint32_t freq_window_start_ms_{0};
+  uint32_t learn_until_ms_{0};
+
+  bool is_likely_chatter(const std::vector<uint8_t> &burst) {
+    // Short bursts dominated by the “segment pattern” set are usually display scans/status beacons.
+    // Heuristic: values limited to this set and length <= 6 are likely chatter.
+    static const uint8_t kSet[] = {
+      0x00,0x06,0x18,0x1E,0x60,0x66,0x78,0x7E,0x80,0x86,0x98,0x9E,0xE0,0xE6,0xF8,0xFE
+    };
+    auto in_set = [](uint8_t x) {
+      for (auto v : kSet) if (x == v) return true;
+      return false;
+    };
+    size_t in = 0;
+    for (uint8_t b : burst) if (in_set(b)) in++;
+    if (burst.size() <= 6 && in == burst.size()) return true;
+    return false;
+  }
+
+  void handle_burst(const std::vector<uint8_t> &burst) {
+    if (burst.size() < min_len_to_log) return;
+
+    // Rolling window for frequency counts (5s)
+    const uint32_t now = millis();
+    if (now - freq_window_start_ms_ > 5000) {
+      freq_.clear();
+      freq_window_start_ms_ = now;
+    }
+
+    const std::string sig = hex_join(burst, "");  // compact signature (no dots)
+    auto &cnt = freq_[sig];
+    cnt++;
+
+    const bool ends_with_sentinel = !burst.empty() && (burst.back() == 0xFE || burst.back() == 0x7E);
+    const bool chatterish = is_likely_chatter(burst);
+    const bool learned = (now < learn_until_ms_);
+
+    // Suppress very frequent patterns unless we are in "log everything" or learning phase
+    if (!log_everything) {
+      if (cnt >= chatter_threshold || chatterish) {
+        if (learned) {
+          ESP_LOGV(TAG, "[learn] mute soon %s (%u)", format_hex_pretty(burst).c_str(), cnt);
+        }
+        return;
+      }
+    }
+
+    // Emphasize potentially interesting frames
+    if (highlight_sentinels && ends_with_sentinel && burst.size() >= 6) {
+      ESP_LOGI(TAG, "FRAME %s (%u)", format_hex_pretty(burst).c_str(), (unsigned)burst.size());
+    } else {
+      ESP_LOGD(TAG, "Burst %s (%u)", format_hex_pretty(burst).c_str(), (unsigned)burst.size());
+    }
+  }
 };
 
 }  // namespace arv_rs485_logger
